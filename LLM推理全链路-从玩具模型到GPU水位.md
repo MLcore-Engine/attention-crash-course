@@ -29,7 +29,7 @@
 第1章  注意力的头与维度      ← 零件：一个向量怎么切成头
 第2章  一个 token 的两张账单  ← 度量：计算量与存储量
 第3章  KV cache 的物理存储    ← 数据：算出来的东西放哪
-第4章  GPU 硬件与 Roofline    ← 硬件：谁在算、谁在搬
+第4章  GPU 硬件与 Roofline    ← 硬件：谁在算、谁在搬（结论版）
 第5章  Prefill 与 Decode      ← 过程：两种截然不同的阶段
 第6章  cached token 的真实成本 ← 账目：省了什么、没省什么
 第7章  vLLM 调度器与排队      ← 系统：请求为什么进不来
@@ -39,6 +39,8 @@
 先有零件和度量，才谈得上硬件；先懂硬件，才看得懂 prefill/decode 的区别；先懂区别，才算得清缓存的账；先算清账，才明白排队的原因；最后才轮到水位。
 
 **倒着读（从第 8 章开始）也可以**，但会在每个「为什么」处需要往前翻。
+
+> 第 4 章是**结论版**（只留 `412`、`206`、decode 下界这些后面要用的数字）。torch → CUDA → SM → HBM 的完整机理、以及线上排障的 `ncu` 判据，单独成篇：[GPU硬件与Roofline-从torch到CUDA到SM.md](./GPU硬件与Roofline-从torch到CUDA到SM.md)。两篇数字完全一致。
 
 ### 0.3 贯穿全文的玩具模型：TinyToy
 
@@ -2235,9 +2237,16 @@ KV/token 是容量约束和带宽约束的共同分子 → 缩小它双倍收益
 
 ---
 
-## 第 4 章 GPU 硬件与 Roofline
+## 第 4 章 GPU 硬件与 Roofline（结论版）
 
 > 对应追问：「从 GPU 硬件原理 HBM / SM / Tensor Core 层面开始讲解」
+>
+> **本章是结论版**：只保留第 5–8 章要用的数字与公式，每节一句「机理见哪里」。
+> 完整机理——torch 的调用链与 launch 账、CUDA 的 warp / occupancy / 合并访存、SM 微架构与 Tensor Core 指令形态、HBM 的 bank / row buffer、以及线上排障的 `ncu` 判据树——见独立文档：
+> **[GPU硬件与Roofline-从torch到CUDA到SM.md](./GPU硬件与Roofline-从torch到CUDA到SM.md)**
+>
+> 两篇的硬数字完全一致：141 GB / 4.8 TB/s / 132 SM / 1979 / 989 / 412 / 206 / 2.4 MB，可逐项互查（独立文档附录 E.3）。
+> **本章内出现的 `§N` 一律指独立文档的节号**（本章自己的节号写成 `4.x`）。
 
 前三章讲了数据和度量。这一章讲**谁来算、谁来搬、以及两者的速度差多少**。
 
@@ -2251,71 +2260,51 @@ H200 的 HBM3e 是 6 个堆栈，通过 silicon interposer 上的超宽总线连
 延迟  ~500 ns     ← 决定「要多少并发才能填满带宽」
 ```
 
-**这三个数字是三个独立的约束。** 后面会看到：
-
-- KV cache 撞的是**容量**
-- decode 撞的是**带宽**
-- prefill 撞的是**算力**
-
-它们可以同时存在、互不相关。「满载」必须指明是哪一个满。
+**这三个数字是三个独立的约束**：KV cache 撞容量、decode 撞带宽、prefill 撞算力，可以同时存在。→ 堆栈/通道/bank/row 的物理结构见 §28。
 
 ### 4.2 Little's Law：batch 存在的物理理由
 
-延迟那一项容易被忽略，但它是 batch 存在的根本原因。
-
-按 Little's Law，要填满带宽，必须有足够多的数据「同时在飞」：
+要填满带宽，必须有足够多的数据「同时在飞」：
 
 ```
-在途数据量 = 带宽 × 延迟
-           = 4.8e12 B/s × 500e-9 s
-           = 2.4 MB
-
-摊到 132 个 SM = 每个 SM 要有 18 KB 数据同时在飞
+在途数据量 = 带宽 × 延迟 = 4.8e12 × 500e-9 = 2.4 MB
+摊到 132 个 SM = 每个 SM 18 KB ≈ 142 条 128 B line
 ```
 
-一个 SM 的 shared memory 才 228 KB。所以**必须有很多 warp 同时发起访存请求**，靠并发把延迟藏起来。
-
-**batch=1 时很多 kernel 根本发不出足够的访存请求**，实测带宽连 4.8 TB/s 的一半都到不了。这是第 5 章场景 A 雪上加霜的原因。
+而一个 SM 最多 64 个 warp，**所以每个 warp 必须有 2–3 个未完成的 load**。batch=1 时发不出足够的访存请求，实测带宽连一半都到不了——这是第 5 章场景 A 雪上加霜的原因。→ 严格算法、MSHR 上限与「每个 warp 要几个在途」见 §14。
 
 ### 4.3 SM：计算的发生地
 
-H200 有 **132 个 SM**（Streaming Multiprocessor）。每个 SM 里：
+H200 有 **132 个 SM**。每个 SM：
 
 ```
 4 个 Tensor Core（第 4 代）
 128 个 FP32 CUDA Core
-4 个 warp scheduler
+4 个 warp scheduler（每 cycle 各发 1 条 warp 指令）
 256 KB 寄存器堆
 228 KB shared memory / L1（可配置比例）
 ```
 
-SM 是**独立调度**的单位。一个 kernel 启动后被切成 thread block，分派到各 SM。SM 之间不共享 shared memory，只能通过 L2 / HBM 通信。
+SM 独立调度，一个 kernel 的 block 分派到各 SM，**block 永不跨 SM**。→ GPC/TPC 布局与 sub-partition 结构见 §23、§24。
 
 ### 4.4 CUDA Core vs Tensor Core：32 倍差距
 
-**CUDA Core** 干的事：一条 FMA 指令 = `a*b+c` = 2 FLOP。
+**CUDA Core**：一条 FMA = `a*b+c` = 2 FLOP。
 
 ```
-FP32 峰值 = 132 SM × 128 core × 2 FLOP × 1.8 GHz
-         = 60.8 TFLOPS
+FP32 峰值 = 132 SM × 128 core × 2 FLOP × 1.8 GHz = 60.8 TFLOPS
 ```
 
-**Tensor Core** 干的事：一条指令完成一个**小矩阵块**的乘加，比如 `D = A×B + C`，A 是 16×16、B 是 16×8（m16n8k16 tile）。一个 warp 发一条指令，硬件在几个 clock 内吐出整个结果块。
+**Tensor Core**：一条指令完成一个矩阵块乘加（如 `m16n8k16`，2048 次 MAC = 4096 FLOP）。
 
 ```
-每个 TC 每 clock ≈ 1024 次 FP8 MAC
-
+每 TC 每 clock ≈ 1024 次 FP8 MAC
 FP8 峰值 = 132 SM × 4 TC × 1024 MAC × 2 FLOP × 1.8 GHz
-         = 1946 TFLOPS ≈ 1979 TFLOPS（官方标称）
-```
-
-```
+         = 1946 ≈ 1979 TFLOPS（官方标称）
 1979 / 60.8 ≈ 32 倍
 ```
 
-**这就是为什么所有 LLM 推理都必须走 Tensor Core。**
-
-也是为什么「GPU 利用率 90%」这个数字毫无意义——SM 里的 CUDA Core 在搬数据、算 RMSNorm、做 softmax，Tensor Core 可能一次都没点火。第 8 章会给出正确的指标。
+**注意口径**：32 倍是 **FP8 TC 对 FP32 CUDA Core**；BF16 TC 对 FP32 是 **16 倍**（989/60.8）。这是所有 LLM 推理都走 Tensor Core 的原因，也是「GPU 利用率 90%」毫无意义的原因——CUDA Core 在搬数据、算 RMSNorm、做 softmax 时，Tensor Core 可能一次都没点火。→ 指令级细节与峰值推导见 §25、§26。
 
 ### 4.5 内存层级
 
@@ -2327,39 +2316,29 @@ SMEM/SM    228 KB      ~30 TB/s聚合   ~30 ns
 寄存器      256 KB/SM   ~数百 TB/s     ~1 clock
 ```
 
-**FlashAttention 的全部把戏**就是：把 Q/K/V 的分块塞进 228 KB 的 SMEM，在片上算完 attention，**绝不把 L×L 的中间矩阵写回 HBM**。
-
-它省的是**带宽**，不是 FLOPs。计算量一分没少（第 1 章已证明多头 FLOPs 恒定），少的是 HBM 往返。
+**FlashAttention 的全部把戏**：把 Q/K/V 分块塞进 228 KB 的 SMEM，在片上算完 attention，**绝不把 L×L 的中间矩阵写回 HBM**。它省的是带宽，不是 FLOPs。→ 143 ms→2.2 ms 的字节账见 §20；`30 TB/s` 的推导与 sector 旅程见 §27、§29。
 
 ### 4.6 Roofline：一个数字解释一切
 
-**算术强度**（Arithmetic Intensity, AI）：
-
 ```
 AI = 这个 kernel 做的 FLOPs ÷ 它从 HBM 搬的字节数
-```
-
-**拐点**（ridge point）= 峰值算力 / 峰值带宽：
-
-```
-H200 FP8 拐点 = 1979 TFLOPS / 4.8 TB/s = 412 FLOP/byte
+拐点 = 峰值算力 / 峰值带宽 = 1979 TFLOPS / 4.8 TB/s = 412 FLOP/byte
 ```
 
 - **AI > 412** → 计算密集，Tensor Core 是瓶颈，带宽闲着
 - **AI < 412** → 内存密集，HBM 是瓶颈，Tensor Core 闲着
 
+→ 五个口径陷阱（写回、L2 命中、split-K、精度配套、KV 读几遍）见 §34。
+
 ### 4.7 AI ≈ 2M：一个必须记住的推导
 
-把 roofline 套到 LLM 的线性层上。一个 GEMM `[M,K] × [K,N]`，FP8 权重：
+一个 GEMM `[M,K] × [K,N]`，FP8 权重：
 
 ```
 FLOPs = 2·M·K·N
 Bytes ≈ K·N        （M 很小时，权重字节主导，激活可忽略）
-
 AI ≈ 2·M·K·N / (K·N) = 2M
 ```
-
-> **AI ≈ 2M，M 就是这一次 GEMM 里有多少个 token。**
 
 令 AI 等于拐点：
 
@@ -2370,14 +2349,9 @@ AI ≈ 2·M·K·N / (K·N) = 2M
 > ### 全文最重要的一个数字
 > **H200 上，一次 GEMM 里必须塞进约 206 个以上的 token，Tensor Core 才吃得饱。**
 
-（BF16 权重也一样：字节翻倍使 `AI = M`，但 BF16 峰值减半使拐点变成 `989/4.8 = 206`，所以 `M = 206` 不变。）
+（BF16 权重也一样：字节翻倍使 `AI = M`，但 BF16 峰值减半使拐点变成 `989/4.8 = 206`，所以 `M = 206` 不变。通用式 `M* = P·b/(2·BW)`，见独立文档 §35 的精度不变性证明。）
 
-这个 206 是：
-
-- prefill 和 decode 的分水岭
-- continuous batching 存在的理由
-- 投机解码有效的原理
-- 第 7 章「槽位满但算力才 72%」那个场景的解释
+这个 206 是：prefill 与 decode 的分水岭、continuous batching 的理由、投机解码有效的原理、第 7 章「槽位满但算力才 72%」的解释。
 
 ### 4.8 TinyToy 的 AI 验算
 
@@ -2421,7 +2395,7 @@ T=32:
 
 **AI 从 3.04（T=3）涨到 32.3（T=32），近似线性。** 这就是 prefill 越长越「计算密集」的原因。
 
-注意 TinyToy 的 AI 绝对值远小于真实模型（因为 H=8 太小，权重字节相对太多），**但变化规律完全一致**。
+注意 TinyToy 的数值与真实模型差一个**精度因子**：TinyToy 用 BF16（`AI_linear = M`），主线对照用 FP8（`AI_linear = 2M`）。同为 T=32 时两者分别是 32 与 64；**换成同精度则完全一致**，变化规律也完全一致。→ 这个 2 倍的口径换算、以及可运行的复算脚本见 §40、附录 C。
 
 ### 4.9 三种数据的生命周期
 
@@ -2431,22 +2405,15 @@ T=32:
 | 激活 | SMEM/寄存器 | 几十 MB~几 GB | 单层内，用完即弃 | 否 |
 | KV cache | HBM | 0 → 50 GiB | 请求级，跨步累积 | **每步全部重读一遍** |
 
-关键在最后一列：**权重和 KV 每一步都要从 HBM 完整读一遍。**
-
-- 权重是**固定开销**（与 batch 无关）
-- KV 是**随上下文长度和并发数线性增长的开销**
+关键在最后一列：**权重和 KV 每一步都要从 HBM 完整读一遍。** 权重是固定开销（与 batch 无关），KV 是随上下文和并发线性增长的开销。→ 每个算子的 AI 位置表见 §37。
 
 ### 4.10 decode 的物理下界
-
-这两个加起来除以带宽，就是 decode 一步的**物理下界**：
 
 ```
 step 时间 ≥ (权重字节 + 全部 KV 字节) / HBM 带宽
 ```
 
-**任何 kernel 优化都突破不了这个下界。** FlashAttention、CUDA Graph、算子融合——全都只能帮你逼近它，不能低于它。
-
-要突破，只能动分子或分母本身（第 8 章列出四个手段）。
+**任何 kernel 优化都突破不了这个下界。** FlashAttention、CUDA Graph、算子融合——全都只能帮你逼近它。要突破只能动分子或分母本身（第 8 章列出四个手段）。→ 四个方向的定量收益、TP 的两面性见 §38。
 
 ### 4.11 vLLM 的显存账本
 
@@ -2460,9 +2427,7 @@ KV池 = 总显存 × gpu_memory_utilization − 权重 − 峰值激活 − non_
 
 全文取整为 **50 GiB** 便于计算（比实际乐观约 2.5%，不影响任何结论的量级）。
 
-**注意 `gpu_memory_utilization=0.9` 意味着留了 14 GB 完全不用。** 这是 vLLM 的保守设计，也是「账面显存没满但已经在排队」的一个来源。
-
-第 7 章会揭示一个隐含耦合：**profile 用的假 token 数量 = `max_num_batched_tokens`**，所以调大那个旋钮会偷偷削减 KV 池。
+**注意 `gpu_memory_utilization=0.9` 意味着留了 14 GB 完全不用。** 第 7 章会揭示一个隐含耦合：profile 用的假 token 数量 = `max_num_batched_tokens`，调大那个旋钮会偷偷削减 KV 池。→ `allocated / reserved / nvidia-smi` 三个数的关系见 §4。
 
 ### 4.12 本章小结
 
@@ -2476,6 +2441,23 @@ Roofline 拐点 = 1979/4.8 = 412 FLOP/byte
 decode 物理下界 = (权重 + KV) / 带宽，不可突破
 KV池 = 总显存×0.9 − 权重 − 激活 − non_torch
 ```
+
+### 本章与独立文档的对照
+
+| 本节 | 独立文档 |
+|---|---|
+| 4.1 HBM 三约束 | §27 内存层级、§28 HBM 物理 |
+| 4.2 Little's Law | §14 延迟隐藏的严格算法 |
+| 4.3 SM | §23 die 平面、§24 SM 微架构 |
+| 4.4 Core vs TC | §25 Tensor Core 指令、§26 峰值推导 |
+| 4.5 内存层级 | §20 attention 融合、§29 sector 旅程 |
+| 4.6 Roofline | §34 AI 口径陷阱 |
+| 4.7 AI ≈ 2M | §35 拐点与精度不变性 |
+| 4.8 TinyToy | §40 原表复算 |
+| 4.9 生命周期 | §37 算子位置表 |
+| 4.10 下界 | §38 四个突破口 |
+| 4.11 显存账本 | §4 allocator、§27 每层能装多少 KV |
+| 4.12 小结 | §43 速查卡 |
 
 > **真实模型对照汇总**
 > - 拐点 412，M 阈值 206

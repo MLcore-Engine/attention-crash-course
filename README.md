@@ -15,6 +15,14 @@
 
 ## 仓库内容
 
+### [`多头注意力-8维手算到真实大模型.md`](./多头注意力-8维手算到真实大模型.md)
+
+从「投影后 reshape 为什么会改变 attention」讲起，用同一组 8 维 Q/K/V 完整对比单头与四头的分数、softmax 权重和输出，再说明真实推理的 KV cache、MHA/GQA/MQA/MLA，以及 `step-5-preview`、`deepseek-v4.1-flash` 的公开架构证据边界。适合在主线文档之前阅读。
+
+### [`cheatsheet-llm-inference-2026.md`](./cheatsheet-llm-inference-2026.md)
+
+面向推理系统的中文速查表：覆盖 KV 容量估算、Paged KV 与 Prefix Caching、KV 压缩、Attention Kernel、调度、Speculative Decoding、量化及排障。更新基准为 2026-11-25，附论文和官方文档链接。
+
 ### [`LLM推理全链路-从玩具模型到GPU水位.md`](./LLM推理全链路-从玩具模型到GPU水位.md)
 
 主线文档。回答一个问题：**为什么 LLM 推理的瓶颈不在算力，而在带宽？**
@@ -25,12 +33,25 @@
 | 1 | 注意力的头与维度：宽度守恒、多头为什么免费、GQA 分组、共享 K/V 为什么不塌缩 |
 | 2 | 一个 token 的两张账单：`2N` FLOPs 与 KV 字节的五因子拆解 |
 | 3 | KV cache 的物理存储：为什么存 K/V 不存 Q、PagedAttention、prefix caching |
-| 4 | GPU 硬件与 Roofline：HBM / SM / Tensor Core、`AI ≈ 2M`、decode 的物理下界 |
+| 4 | GPU 硬件与 Roofline：HBM / SM / Tensor Core、`AI ≈ 2M`、decode 的物理下界（**结论版**，机理见下方独立文档） |
 | 5 | Prefill 与 Decode：两种负载的形状差异 |
 | 6 | cached token 的真实成本：算力 5× / 并发 3× / 带宽 1× |
 | 7 | vLLM 调度器与排队：五道准入闸门 |
 | 8 | 水位：算力 / 带宽 / KV / 槽位四维取 max |
 | 附录 | TinyToy 完整规格、Llama-3-70B 对照、公式速查卡、术语表、易错点清单 |
+
+### [`GPU硬件与Roofline-从torch到CUDA到SM.md`](./GPU硬件与Roofline-从torch到CUDA到SM.md)
+
+主线第 4 章的**机理版 / 硬件知识库**。主线那一章只给结论（412、206、decode 下界），这一份把 `y = x @ W` 一路拆到 HBM 的一个 burst：
+
+| 部分 | 覆盖 |
+|---|---|
+| torch 层 | Tensor 六字段与 stride、`x @ W` 的五跳调用链、eager 三笔成本、caching allocator 三个数、stream/event、CUDA Graph、`torch.compile` 融合账、能实测的三个数、`GPU-Util` 误读 |
+| CUDA 层 | grid/block/warp/lane、divergence、occupancy 四因子、延迟隐藏的在途请求算术、合并访存与 32 B sector、SMEM bank conflict/swizzle、寄存器 spill、`cp.async`/TMA/warp specialization、**GEMM 五级演进**、attention 融合的字节账、小 batch 并行度账 |
+| 硬件层 | GPC/TPC/SM 平面、SM 微架构与指令延迟表、`mma`/`ldmatrix`/`wgmma`/`tcgen05` 的 fragment 布局、峰值算力推导、内存层级、**HBM 堆栈→pseudo-channel→bank→row**、sector 旅程、NVLink/PCIe 与 TP 通信账、功耗时钟 |
+| 量化 | AI 的五个口径陷阱、拐点 412 与 `M* = P·b/(2·BW)` 的精度不变性、三种利用率与 MFU/MBU、算子 roofline 位置表、四个突破口、`ncu` 判据决策树、TinyToy 复算 |
+
+附录含 **可直接运行的验证脚本**（纯 CPU 的常数/拐点/occupancy/TinyToy 断言，以及需要 GPU 的带宽与 GEMM 基准），以及与主线逐条对照的「增量清单 / 口径来源」。
 
 ### [`TinyToy_LLM推理全链路.ipynb`](./TinyToy_LLM推理全链路.ipynb)
 

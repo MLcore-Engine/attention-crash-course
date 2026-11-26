@@ -1,16 +1,17 @@
-# PagedAttention 与 Prefix Caching：原理与 vLLM 实现
+# PagedAttention 与 Prefix Caching：原理与 vLLM / SGLang 实现
 
 > 配套主线文档：[LLM推理全链路-从玩具模型到GPU水位.md](file:///Users/jyxc-dz-0100664/Documents/Qoder/2026-11-19/69b4e9d0/LLM推理全链路-从玩具模型到GPU水位.md) 第 3 章。
 > 主线文档的 §3.6 / §3.7 是**结论版**；这一份是**推导版 + 源码版**。
-> 本文所有数字都由附录 A 的脚本实际执行验证过（125 项断言全部通过），源码引用锁定 **vLLM v0.11.0**。
+> 本文所有数字都由附录 A / E 的脚本实际执行验证过（共 **79 + 33** 项断言全部通过），vLLM 源码锁定 **v0.11.0**，SGLang 源码锁定 **v0.5.2**。
+> 第一至第六部分是 vLLM 的推导与源码；**第七部分（§28–§35）是 SGLang 的对照实现**，用来回答「同样的前缀复用，换一种数据结构会长什么样」。
 
 ---
 
 ## 0 导读
 
-### 0.1 这份教程要回答的四个问题
+### 0.1 这份教程要回答的五个问题
 
-主线文档告诉你「PagedAttention 把利用率从 37.5% 提到 75%」。这句话是对的，但它跳过了四个真正需要理解的地方：
+主线文档告诉你「PagedAttention 把利用率从 37.5% 提到 75%」。这句话是对的，但它跳过了五个真正需要理解的地方：
 
 | # | 问题 | 本文位置 |
 |---|---|---|
@@ -18,6 +19,7 @@
 | 2 | K/V 在物理上不连续了，attention 的数学**为什么一点都不变**？ | 第二、三部分（§5–§11） |
 | 3 | vLLM 里到底是谁在什么时候调用了谁，一个块从领取到归还经过了哪些字段？ | 第四部分（§12–§16） |
 | 4 | Prefix caching 命中之后，**哪些成本真的消失了，哪些一分钱没省**？为什么明明整块缓存了却还要重算一整块？ | 第五部分（§17–§25） |
+| 5 | 同样的机制换一套数据结构（SGLang 的基数树）会长什么样？哪些不变量不变？ | 第七部分（§28–§35） |
 
 ### 0.2 贯穿全文的玩具规格：TinyToy
 
@@ -77,7 +79,9 @@ KV 池与分块：
 
 ### 0.4 边界声明
 
-- 源码版本 **v0.11.0**，V1 引擎。V0 的 `BlockSpaceManager` 是另一套实现，本文不涉及。
+- vLLM 源码版本 **v0.11.0**，V1 引擎。V0 的 `BlockSpaceManager` 是另一套实现，本文不涉及。
+- SGLang 源码版本 **v0.5.2**（`radix_cache.py` / `allocator.py` / `memory_pool.py` / `schedule_batch.py`）。SGLang 的 `page_size` 默认是 1，本文在对照示例里取 4 是为了和 vLLM 的 `block_size=4` 同尺度；两者不是同一个参数。
+- **版本提醒**：写作时 vLLM 最新为 0.34.x、SGLang 最新为 0.5.23。本文锁定 v0.11.0 / v0.5.2，是为了让行号和类名可复现。SGLang 新版已把 `RadixCache` 重构出 `RadixKey` / `UnifiedRadixCache`，机制仍是基数树 + 叶子 LRU，但 API 有变化；vLLM 新版仍保留 `block_pool.py` 的块池结构，细节有演进。
 - 本文只讲 **full attention**（`FullAttentionManager`）。sliding window、Mamba、hybrid 多 KV cache group 的差异只在需要时点一句，不展开。
 - 张量并行 / DCP（decode context parallel）会改变 `block_size` 的有效值和 slot 计算，§6.3 给出真实代码分支，但不展开分布式布局。
 - **所有绝对时间都没有意义**，本文只验证公式、比例和机制。
@@ -1046,7 +1050,8 @@ if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
 while True:
     new_blocks = self.kv_cache_manager.allocate_slots(request, num_new_tokens, ...)
     if new_blocks is None:
-        # 抢占优先级最低的请求
+        # 默认 FCFS 策略：running 按到达顺序排，pop() 取队尾 = 最晚进来的
+        # PRIORITY 策略下换成 max(self.running, key=lambda r: (r.priority, r.arrival_time))
         preempted_req = self.running.pop()          # ← 弹出队尾
         self.kv_cache_manager.free(preempted_req)
         preempted_req.status = RequestStatus.PREEMPTED
@@ -1679,9 +1684,746 @@ def append_row(self, block_ids, row_idx):
 
 ---
 
+# 第七部分 对照实现：SGLang 的 RadixCache
+
+## 28 先厘清：哪些是「代码」，哪些是「模型」
+
+这一节先把上一版里容易被误读的地方钉死。
+
+| 位置 | 性质 | 本次处理 |
+|---|---|---|
+| §12–§13、§16、§19–§20 的源码片段 | 逐行摘自 **vLLM v0.11.0** | 保留，附录 B 补正一处路径 |
+| §14 的 TinyToy 生命周期 | 附录 A 的**语义等价移植**，不是 import vLLM 执行 | 保留；§34 用 SGLang 走同一道题 |
+| §22 的僵尸块 / 惰性淘汰实验 | 同上，是 `BlockPool` 的重写 | 保留 |
+| 「125 项断言全部通过」 | 计数错误：附录 A 实际只有 **79** 个 `assert` | 已改 |
+| `vllm/v1/core/block_table.py` | 路径错误：实际在 `vllm/v1/worker/block_table.py` | 已改 |
+
+**必须说清的一点**：TinyToy 的数字不是 vLLM 跑出来的。它是把 `KVCacheBlock` / `FreeKVCacheBlockQueue` / `BlockPool` 的语义等价重写成约 150 行 Python 后跑出来的。这样做的好处是不用 GPU、可以手算；代价是读者无法仅凭数字确认「移植是否忠实」。所以下面直接把两套实现的源码贴出来，逐段对应；附录 E 再给一个可执行对照模型。
+
+**§14 的每一步仍然能在源码里找到依据**，不是凭空的算术：
+
+| 原文 §14 步骤 | 源码位置 | 关键条件 |
+|---|---|---|
+| A 长 3，不缓存 | `single_type_kv_cache_manager.py:133` | `num_full_blocks = 3 // 4 = 0` |
+| A 长 4，缓存块 1 | `block_pool.py:188` `cache_full_blocks` | `num_full_blocks = 4 // 4 = 1` |
+| A 长 5，领块 2 | `single_type_kv_cache_manager.py:109` | `cdiv(5,4) - 1 = 1` |
+| B 命中块 1 | `single_type_kv_cache_manager.py:252` | `islice` 沿 hash 链走，miss 即 `break` |
+| A 结束，逆序释放 | `single_type_kv_cache_manager.py:168` | `ordered_blocks = reversed(req_blocks)` |
+| 块 1 `ref=1`，不入空闲队列 | `block_pool.py:338` | 只 append `ref_cnt == 0` 的块 |
+| 块 0 被 null block 占掉 | `block_pool.py:157` | `self.null_block = self.free_block_queue.popleft()` |
+
+**不能从这些数字推出的东西**，原文 §4.2 / §26.2 已经列过；这里只补一条：**TinyToy 的「8 块」是 `num_gpu_blocks` 的理想算术，不是 `get_usage` 的分母。** 真实 `get_usage()` 的分母是 `num_gpu_blocks − 1`（`block_pool.py:400`）：8 块池的初始值是 `1 − 7/7 = 0`，7 块可用块全部分配时才是 `1 − 0/7 = 1.0`。
+
+**两套设计的一句话版本**：
+
+| | vLLM v0.11.0 | SGLang v0.5.2 |
+|---|---|---|
+| 一句话 | 固定块 + 块级哈希链 + 双向空闲链表 | token 页 + 基数树 + 叶子 LRU 堆 |
+| 前缀的 key | 块内容的哈希（父哈希链式嵌套） | 原始 token 序列（树路径） |
+| 前缀的 value | 物理块号 | KV slot 下标 |
+| 每请求映射 | `block_table`：逻辑块号 → 物理块号 | `req_to_token`：token 位置 → KV slot |
+
+两套实现解决的是同一个问题：**在「KV 必须按 token 连续逻辑顺序参与 attention」和「物理显存只能按固定单位分配」之间做地址翻译，并把重复前缀的物理 KV 复用出去。** 差异在于它们选择了不同的中间层：vLLM 选择「块表」，SGLang 选择「token 索引 + 基数树」。
+
+**源码怎么复现**（只取需要的目录，不拉全仓库）：
+
+```bash
+git clone --depth 1 --branch v0.11.0 --filter=blob:none --sparse \
+  https://github.com/vllm-project/vllm.git vllm-0.11.0
+cd vllm-0.11.0 && git sparse-checkout set vllm/v1/core vllm/v1/worker csrc
+
+git clone --depth 1 --branch v0.5.2 --filter=blob:none --sparse \
+  https://github.com/sgl-project/sglang.git sglang-0.5.2
+cd sglang-0.5.2 && git sparse-checkout set \
+  python/sglang/srt/mem_cache python/sglang/srt/managers
+```
+
+本文引用的所有 `:行号` 都以这两个 tag 为准。
+
+---
+
+## 29 SGLang 的两级内存结构
+
+### 29.1 `ReqToTokenPool`：一行就是一个请求的 token→slot 表
+
+`python/sglang/srt/mem_cache/memory_pool.py:55`：
+
+```python
+class ReqToTokenPool:
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(self, size, max_context_len, device, enable_memory_saver):
+        ...
+        self.req_to_token = torch.zeros(
+            (size, max_context_len), dtype=torch.int32, device=device
+        )
+        self.free_slots = list(range(size))
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def alloc(self, need_size: int) -> List[int]:
+        if need_size > len(self.free_slots):
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+```
+
+关键点：
+
+1. **`req_to_token` 是 `int32` 的二维定长矩阵**，一行一个请求，列是 token 在该请求里的逻辑位置，值是 KV 池里的**槽号**。
+2. 它存的**不是块号**。第 `i` 列直接就是第 `i` 个 token 的 KV 在池子里的下标，attention 拿到这一行就能 gather，不需要 `block_id * block_size + offset` 的二次换算。
+3. 前缀命中后，SGLang 把命中的槽号**直接写进新请求的行**（`schedule_batch.py:1193`）：
+
+```python
+if pre_len > 0:
+    self.req_to_token_pool.write(
+        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+    )
+```
+
+这就是「共享」在 SGLang 里的全部动作：**把同一批槽号复制进另一个请求的行**。没有引用计数块、没有 block table 的物理块号。
+
+### 29.2 `MHATokenToKVPool`：扁平的 per-layer KV 池
+
+`memory_pool.py:449`：
+
+```python
+# [size, head_num, head_dim] for each layer
+# The padded slot 0 is used for writing dummy outputs from padded tokens.
+self.k_buffer = [
+    torch.zeros(
+        (self.size + self.page_size, self.head_num, self.head_dim),
+        dtype=self.store_dtype,
+        device=self.device,
+    )
+    for _ in range(self.layer_num)
+]
+self.v_buffer = [...]
+```
+
+和 vLLM 的「块张量」不同，SGLang 的池子是**按 token 铺平**的：`[size + page_size, head_num, head_dim]`。第 0 行是 padding 专用槽，和 vLLM 的 null block 一样属于「无条件保留的 0 号位」，但用途不同：
+
+| | vLLM | SGLang |
+|---|---|---|
+| 0 号位 | null block，给 sliding window / local attention 当占位符 | padding slot，给 padded token 写 dummy 输出 |
+| 可用量 | `num_gpu_blocks − 1` | `size`（索引起始为 1） |
+
+### 29.3 allocator：`free_pages` 栈 + `release_pages` 延迟回收
+
+`allocator.py:118`：
+
+```python
+class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_pages = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
+        ...
+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+    def alloc(self, need_size: int):
+        if self.need_sort and need_size > len(self.free_pages):
+            self.merge_and_sort_free()
+        if need_size > len(self.free_pages):
+            return None
+        select_index = self.free_pages[:need_size]
+        self.free_pages = self.free_pages[need_size:]
+        return select_index
+
+    def free(self, free_index: torch.Tensor):
+        ...
+        if self.need_sort:
+            self.release_pages = torch.cat((self.release_pages, free_index))
+        else:
+            self.free_pages = torch.cat((self.free_pages, free_index))
+```
+
+三点：
+
+1. **分配单位是 token**（`page_size = 1` 时）。`free_pages` 就是一个可用槽号栈，`alloc(n)` 取前 `n` 个。
+2. **`free` 不一定立刻回到 `free_pages`**。`need_sort` 为真时先进 `release_pages`，等 `merge_and_sort_free()` 再合并排序。这和 vLLM 的「释放只减 ref、淘汰延迟到领块时」是同一个思想：**释放动作与可复用动作解耦**。
+3. `page_size > 1` 时换成 `PagedTokenToKVPoolAllocator`（`allocator.py:419`）：
+
+```python
+self.num_pages = size // page_size
+...
+def alloc(self, need_size: int):
+    num_pages = need_size // self.page_size
+    ...
+    out_pages = self.free_pages[:num_pages]
+    self.free_pages = self.free_pages[num_pages:]
+    out_indices = (
+        out_pages[:, None] * self.page_size
+        + torch.arange(self.page_size, device=self.device)
+    ).reshape(-1)
+    return out_indices
+```
+
+它仍返回**扁平的槽号数组**，只是保证一个请求拿到的页是整页对齐、页内连续的。
+
+### 29.4 与 vLLM `block_table` 的根本区别
+
+| | vLLM | SGLang |
+|---|---|---|
+| 每请求映射 | `block_table[row, logical_block] = physical_block` | `req_to_token[row, position] = slot` |
+| slot 从哪来 | GPU 侧 `physical_block * B + offset` | 直接就是数组里的值 |
+| 分配单位 | 固定 `B` token 的块 | `page_size` 个 token（默认 1） |
+| 映射的稳定性 | **append-only**，已写入的块号不改 | 每次 chunk / 命中后可以整段重写 |
+| 共享的动作 | `ref_cnt += 1`，块号不变 | 把同一批槽号复制进另一行 |
+| 0 号位 | null block | padding slot |
+
+**「映射是否可变」是后面所有设计差异的根**：
+
+- vLLM 的 `block_table` 要增量拷到 GPU，且 GPU 可能正在读这一行，所以块号一旦写下就不能改 → 不能去重、不能把两个同内容块合并。
+- SGLang 的 `req_to_token` 是纯 CPU 侧的行，重写一行只影响下一次 forward 的 gather 索引 → 可以自由 split、合并、复制。
+
+---
+
+## 30 基数树：`RadixCache` 的数据结构
+
+### 30.1 `TreeNode`
+
+`radix_cache.py:43`：
+
+```python
+class TreeNode:
+    def __init__(self, id: Optional[int] = None):
+        self.children = defaultdict(TreeNode)
+        self.parent: TreeNode = None
+        self.key: List[int] = None
+        self.value: Optional[torch.Tensor] = None
+        self.lock_ref = 0
+        self.last_access_time = time.monotonic()
+
+        self.hit_count = 0
+        # indicating the node is locked to protect from eviction
+        self.host_ref_counter = 0
+        # store the host indices of KV cache
+        self.host_value: Optional[torch.Tensor] = None
+        # store hash values of each pages
+        self.hash_value: Optional[List[str]] = None
+
+    @property
+    def evicted(self):
+        return self.value is None
+
+    def __lt__(self, other: "TreeNode"):
+        return self.last_access_time < other.last_access_time
+```
+
+**`key` 和 `value` 是同一段 token 的两种表示**：
+
+```
+key   = [token_id, ...]        这条边覆盖的 token 序列
+value = [kv_slot,  ...]        这些 token 的 KV 在池子里的槽号，长度与 key 相同
+```
+
+树根 `root.key = []`、`root.value = []`、`root.lock_ref = 1`（`radix_cache.py:158` 附近）。根本身永远不淘汰。
+
+### 30.2 子节点怎么索引：按「第一页」分叉
+
+`radix_cache.py:138`：
+
+```python
+if self.page_size == 1:
+    self.key_match_fn = _key_match_page_size1
+    self.get_child_key_fn = lambda key: key[0]
+else:
+    self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+    self.get_child_key_fn = lambda key: tuple(key[:page_size])
+```
+
+- `page_size = 1`：每个 token 一个分叉键，树可以按 token 粒度共享。
+- `page_size = 4`：每个节点至少一页，分叉键是「前 4 个 token 的 tuple」。**这是后端 kernel 的页对齐要求，不是树的要求。**
+
+`_key_match_paged` 只按整页比较：
+
+```python
+def _key_match_paged(key0, key1, page_size):
+    min_len = min(len(key0), len(key1))
+    i = 0
+    while i < min_len:
+        if key0[i : i + page_size] != key1[i : i + page_size]:
+            break
+        i += page_size
+    return i
+```
+
+所以 `page_size > 1` 时，**匹配长度天然是页的整数倍**，不会出现「共享 3 个 token、第 4 个不共享」的中间状态。
+
+---
+
+## 31 命中：`match_prefix`
+
+`radix_cache.py:158`：
+
+```python
+def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    if self.disable or len(key) == 0:
+        return MatchResult(...)
+
+    if self.page_size != 1:
+        page_aligned_len = len(key) // self.page_size * self.page_size
+        key = key[:page_aligned_len]
+
+    value, last_node = self._match_prefix_helper(self.root_node, key)
+    if value:
+        value = torch.cat(value)
+    else:
+        value = torch.empty((0,), dtype=torch.int64, device=self.device)
+    return MatchResult(
+        device_indices=value,
+        last_device_node=last_node,
+        last_host_node=last_node,
+    )
+```
+
+`_match_prefix_helper`（`radix_cache.py:367`）：
+
+```python
+def _match_prefix_helper(self, node: TreeNode, key: List):
+    node.last_access_time = time.monotonic()
+    child_key = self.get_child_key_fn(key)
+    value = []
+    while len(key) > 0 and child_key in node.children.keys():
+        child = node.children[child_key]
+        child.last_access_time = time.monotonic()
+        prefix_len = self.key_match_fn(child.key, key)
+        if prefix_len < len(child.key):
+            new_node = self._split_node(child.key, child, prefix_len)
+            value.append(new_node.value)
+            node = new_node
+            break
+        else:
+            value.append(child.value)
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+    return value, node
+```
+
+逐步拆开：
+
+1. **页对齐**：`len(key) // page_size * page_size`。这是 `(num_tokens−1)//B` 在 SGLang 里的等价物 —— 只匹配整页。
+2. **按第一页找孩子**：`get_child_key_fn(key)` 取 `key[0]` 或 `tuple(key[:page_size])`。
+3. **逐节点匹配**：`prefix_len` 是该节点 key 与查询 key 的公共前缀长度（页对齐）。
+4. **部分命中就分裂**：如果 `prefix_len < len(child.key)`，说明查询只命中了这个节点的前半段。`_split_node` 把原节点一分为二，前半段成为新节点，查询返回新节点。
+5. **一 miss 即停**：`while` 条件不满足就退出。和 vLLM 的 `break` 一样，命中永远是连续前缀。
+6. **返回值是槽号**：`value` 是每个命中节点的 `value` 拼接，最终是 `[kv_slot, ...]`，直接写进 `req.prefix_indices`。
+
+### 31.1 为什么必须分裂
+
+设 `page_size = 4`，树里已经有一条边：
+
+```
+root -- key=[1,2,3,4,5,6,7,8] value=[11..18] --> leaf
+```
+
+来了一个查询 `[1,2,3,4,9]`：
+
+- 第一页 `(1,2,3,4)` 命中。
+- 第二页 `(5,6,7,8)` vs `(9,...)` 不匹配 → `prefix_len = 4 < 8`。
+- `_split_node` 把原边拆成：
+  ```
+  root -- key=[1,2,3,4] value=[11,12,13,14] --> new_node
+  new_node -- key=[5,6,7,8] value=[15,16,17,18] --> old leaf
+  ```
+- 查询返回 `[11,12,13,14]`，`last_node = new_node`。
+
+**分裂不复制 KV 数据**，只改 `key` / `value` 的切片边界。原 leaf 的 `value` 变成 `[15..18]`，新节点的 `value` 是 `[11..14]`，物理槽号一个都没动。这是基数树能支持「任意长度前缀共享」的关键。
+
+---
+
+## 32 写入：`insert` / `cache_finished_req` / `cache_unfinished_req`
+
+### 32.1 `_insert_helper`
+
+`radix_cache.py:411`：
+
+```python
+def _insert_helper(self, node: TreeNode, key: List, value):
+    node.last_access_time = time.monotonic()
+    if len(key) == 0:
+        return 0
+
+    child_key = self.get_child_key_fn(key)
+    total_prefix_length = 0
+    while len(key) > 0 and child_key in node.children.keys():
+        node = node.children[child_key]
+        node.last_access_time = time.monotonic()
+        prefix_len = self.key_match_fn(node.key, key)
+        total_prefix_length += prefix_len
+        key = key[prefix_len:]
+        value = value[prefix_len:]
+
+        if prefix_len < len(node.key):
+            new_node = self._split_node(node.key, node, prefix_len)
+            node = new_node
+
+        if len(key):
+            child_key = self.get_child_key_fn(key)
+
+    if len(key):
+        new_node = TreeNode()
+        new_node.parent = node
+        new_node.key = key
+        new_node.value = value
+        node.children[child_key] = new_node
+        self.evictable_size_ += len(value)
+    return total_prefix_length
+```
+
+两个语义要点：
+
+1. **返回值 `total_prefix_length` 是「插入前已经存在的公共前缀长度」**，不是「插入后的总长度」。调用方靠它判断哪些 KV 槽是重复的、可以立刻释放。
+2. **只有真正新增的后缀才 `evictable_size_ += len(value)`**。已存在的节点不重复计入。`value` 的所有权从请求转移给树节点 —— 树「持有一份引用」，这就是 `cache_finished_req` 里那句注释 `Radix Cache takes one ref in memory pool` 的含义。
+
+### 32.2 `cache_finished_req`：请求结束时把前缀交给树
+
+`radix_cache.py:203`（删去 disable 分支和空行）：
+
+```python
+def cache_finished_req(self, req: Req):
+    token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+    kv_indices = self.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : len(token_ids)
+    ]
+
+    if self.page_size != 1:
+        page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+    else:
+        page_aligned_len = len(kv_indices)
+        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+    # Radix Cache takes one ref in memory pool
+    new_prefix_len = self.insert(
+        token_ids[:page_aligned_len], page_aligned_kv_indices
+    )
+    self.token_to_kv_pool_allocator.free(
+        kv_indices[len(req.prefix_indices) : new_prefix_len]
+    )
+
+    self.req_to_token_pool.free(req.req_pool_idx)
+    self.dec_lock_ref(req.last_node)
+```
+
+四步，每一步都对应一个易错点：
+
+| 步骤 | 代码 | 含义 |
+|---|---|---|
+| 1 | `(origin_input_ids + output_ids)[:-1]` | **最后一个 token 没有 KV**，必须丢掉。对应 vLLM 的 `num_tokens - 1` |
+| 2 | `free(kv_indices[page_aligned_len:])` | 页对齐之外的尾巴立刻还给分配器，不进树 |
+| 3 | `insert(...)` | 页对齐的前缀交给树；树从此持有这些槽号 |
+| 4 | `free(kv_indices[len(prefix_indices):new_prefix_len])` | 这次重算出来、但树里已经有的**重复槽号**立刻释放，避免泄漏 |
+
+第 4 步是最容易看漏的：`insert` 返回的是「已有前缀长度」，所以 `[len(req.prefix_indices), new_prefix_len)` 这一段是「本次算出来的、但和树里重复的」槽号。树只保留一份，多出来的必须 free。
+
+### 32.3 `cache_unfinished_req`：chunked prefill 的中间态
+
+`radix_cache.py:240`（删去 disable 分支）：
+
+```python
+def cache_unfinished_req(self, req: Req, chunked=False):
+    token_ids = req.fill_ids
+    kv_indices = self.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : len(token_ids)
+    ]
+
+    if self.page_size != 1:
+        page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+    else:
+        page_aligned_len = len(kv_indices)
+        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+    page_aligned_token_ids = token_ids[:page_aligned_len]
+
+    # Radix Cache takes one ref in memory pool
+    new_prefix_len = self.insert(
+        page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+    )
+    self.token_to_kv_pool_allocator.free(
+        kv_indices[len(req.prefix_indices) : new_prefix_len]
+    )
+
+    # The prefix indices could be updated, reuse it
+    new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
+    self.req_to_token_pool.write(
+        (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
+        new_indices[len(req.prefix_indices) :],
+    )
+
+    self.dec_lock_ref(req.last_node)
+    self.inc_lock_ref(new_last_node)
+
+    if self.page_size != 1:
+        req.prefix_indices = torch.cat(
+            [new_indices, kv_indices[len(new_indices) :]]
+        )
+    else:
+        req.prefix_indices = new_indices
+    req.last_node = new_last_node
+```
+
+和 `cache_finished_req` 的差别：
+
+- 请求还没结束，所以 `fill_ids` 全部参与（没有 `[:-1]`）。
+- 插入后**重新 `match_prefix`**，因为 `insert` 可能刚分裂了节点，`last_node` 变了。
+- 把新命中的槽号写回 `req_to_token` 行，然后 `dec` 旧锁、`inc` 新锁。
+- `req.prefix_indices` 更新为「树里命中的部分 + 还没进树的尾巴」。
+
+**调用时机很重要**：`cache_unfinished_req` 只在 **prefill / chunk 结束**时调用（`scheduler_output_processor_mixin.py:94`），**不是每个 decode step 都调用**。decode 过程中树不更新，直到请求结束才由 `cache_finished_req` 一次性插入。这和 vLLM 每个调度步 `allocate_slots → cache_blocks` 的节奏不同，也是 §34 里 A 的 prompt 取 4 而不是 3 的原因。
+
+### 32.4 与 vLLM「不去重」的对照
+
+vLLM 的 `BlockHashToBlockMap` 有一条明确的 NOTE #1：
+
+> We currently don't de-duplicate the blocks in the cache... This is because we want to make sure the allocated block IDs won't change so that block tables are append-only.
+
+SGLang 则相反：`_split_node` 会把一条边拆开，`cache_finished_req` 会把重复的 KV 槽立刻 free。原因在 §29.4 已经说了：
+
+```
+vLLM: block_table 要增量拷 GPU，块号不能改 → 不去重
+SGLang: req_to_token 是 CPU 侧的可变行 → 可以 split / 去重
+```
+
+**这不是谁更先进，而是映射结构的约束不同。** vLLM 用一点显存冗余换「块表 append-only + 无锁增量更新」；SGLang 用树操作换「按 token/页粒度去重」。
+
+---
+
+## 33 锁定与淘汰
+
+### 33.1 `lock_ref`：沿路径保护前缀
+
+`radix_cache.py:319`：
+
+```python
+def inc_lock_ref(self, node: TreeNode):
+    if self.disable:
+        return 0
+    delta = 0
+    while node != self.root_node:
+        if node.lock_ref == 0:
+            self.evictable_size_ -= len(node.value)
+            self.protected_size_ += len(node.value)
+            delta -= len(node.value)
+        node.lock_ref += 1
+        node = node.parent
+    return delta
+
+def dec_lock_ref(self, node: TreeNode):
+    if self.disable:
+        return 0
+    delta = 0
+    while node != self.root_node:
+        if node.lock_ref == 1:
+            self.evictable_size_ += len(node.value)
+            self.protected_size_ -= len(node.value)
+            delta += len(node.value)
+        node.lock_ref -= 1
+        node = node.parent
+    return delta
+```
+
+**锁是沿「节点 → 根」的整条路径加的**，不是只锁叶子。因为要保住一个前缀，必须同时保住它的所有祖先。`lock_ref` 从 0 变 1 时，该节点的 KV 从 `evictable_size_` 移到 `protected_size_`；减回 0 时再移回来。
+
+这和 vLLM 的 `ref_cnt` 是同一个角色：
+
+| | vLLM | SGLang |
+|---|---|---|
+| 计数对象 | 物理块 | 树节点（一段 token） |
+| 加锁动作 | `touch(blocks)`：`ref_cnt += 1`，从空闲队列摘除 | `inc_lock_ref(node)`：沿路径 `lock_ref += 1` |
+| 解锁动作 | `free_blocks`：`ref_cnt -= 1`，归零入队 | `dec_lock_ref(node)`：沿路径 `lock_ref -= 1` |
+| 保护单位 | 单块 | 路径上的所有节点 |
+
+### 33.2 `evict`：叶子最小堆，按 `last_access_time` 淘汰
+
+`radix_cache.py:294`：
+
+```python
+def evict(self, num_tokens: int):
+    if self.disable:
+        return
+
+    leaves = self._collect_leaves()
+    heapq.heapify(leaves)
+
+    num_evicted = 0
+    while num_evicted < num_tokens and len(leaves):
+        x = heapq.heappop(leaves)
+
+        if x == self.root_node:
+            break
+        if x.lock_ref > 0:
+            continue
+
+        self.token_to_kv_pool_allocator.free(x.value)
+        num_evicted += len(x.value)
+        self._delete_leaf(x)
+
+        if len(x.parent.children) == 0:
+            heapq.heappush(leaves, x.parent)
+
+        self._record_remove_event(x)
+```
+
+四个要点：
+
+1. **只有叶子可淘汰**。内部节点还被至少一个孩子引用，删掉它会把孩子的前缀打断。
+2. **堆的排序键是 `last_access_time`**，`TreeNode.__lt__` 定义了它。`match_prefix` / `insert` 都会刷新路径上的时间戳。
+3. **`lock_ref > 0` 直接跳过**。被活跃请求占用的前缀不会被淘汰。
+4. **删掉叶子后，如果父节点变成新叶子，把父节点压回堆**。这样一次 `evict` 可以连续回收一整条链。
+
+`_delete_leaf`（`radix_cache.py:462`）只做两件事：从父节点的 `children` 里摘掉自己、`evictable_size_ -= len(node.key)`。**它不碰 `value` 指向的 KV 数据** —— 数据已经在上一行 `free(x.value)` 里还给分配器了。
+
+### 33.3 什么时候触发淘汰
+
+`schedule_batch.py:1785`：
+
+```python
+def _evict_tree_cache_if_needed(self, num_tokens: int):
+    ...
+    if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+        if self.tree_cache is not None:
+            self.tree_cache.evict(num_tokens)
+```
+
+`alloc_token_slots`（`schedule_batch.py:979`）在真正 `alloc` 之前先调用它：
+
+```python
+def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
+    self._evict_tree_cache_if_needed(num_tokens)
+    ...
+    out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
+```
+
+所以 SGLang 的淘汰时机是：**分配前，先看够不够；不够就按 LRU 淘汰树叶子，再分配。**
+
+vLLM 的淘汰时机是：**分配中，`get_new_blocks` 弹出的块如果是缓存块，顺手 `_maybe_evict_cached_block`。** 两者都是「只有真的需要显存时才清除」，区别只是「先腾后分」还是「边分边腾」。
+
+---
+
+## 34 同一道题的 SGLang 追踪
+
+为了和 §14 对照，沿用同一组请求、同样的 `page_size = 4`，但池子缩小到 **8 个可用槽**（槽 0 保留给 padding，可用 1..8），这样能真正触发淘汰。
+
+> **和 §14 的一处必要差异**：§14 里 A 的 prompt 是 3，靠 decode 补满第 4 个 token。SGLang 的树**不在每个 decode step 更新**：`cache_unfinished_req` 在 prefill / chunk 结束时调用（`scheduler_output_processor_mixin.py:94`），`cache_finished_req` 在请求结束时调用（同文件 `:90`）。所以这里把 A 的 prompt 改成 4，让第一页在 prefill 结束时就进树；否则要等 A 结束，B 才可能命中。
+
+| 步骤 | 动作 | `req_to_token` | 树（key → value, lock） | 空闲槽 | evictable / protected |
+|---|---|---|---|---|---|
+| 0 | 初始 | — | 空 | 1..8 | 0 / 0 |
+| 1 | A prefill 4 token | A: `[1,2,3,4]` | `[1,2,3,4] → [1,2,3,4], lock=1` | 5..8 | 0 / 4 |
+| 2 | A decode 到 5 | A: `[1,2,3,4,5]` | 不变（decode 不更新树） | 6..8 | 0 / 4 |
+| 3 | B prompt 5，前 4 个相同 | B: `[1,2,3,4,6]` | 同一节点，`lock=2` | 7,8 | 0 / 4 |
+| 4 | A 结束（已算 5） | A 行释放 | 节点仍在，`lock=1` | 5,7,8 | 0 / 4 |
+| 5 | C 要 4 槽 | — | `evict(4)` 跳过 `lock=1` 的节点 | 5,7,8 | 0 / 4 |
+| 6 | B 结束（已算 5） | B 行释放 | 节点 `lock=0` | 5,6,7,8 | 4 / 0 |
+| 7 | C 要 8 槽 | — | `evict(8)` 删掉叶子，回收 `[1..4]` | 1..8 | 0 / 0 |
+
+四个值得停下来看的时刻：
+
+**第 1 步：prefill 结束就插入整页。** `cache_unfinished_req` 的 `page_aligned_len = 4 // 4 * 4 = 4`，正好一整页，`insert` 后 `inc_lock_ref` 把这条路径从 evictable 移到 protected。
+
+**第 2 步：decode 不更新树。** 这一点和 vLLM 明显不同：vLLM 每个调度步的 `allocate_slots` 都会调用 `cache_blocks`，块一满就进 hash 表；SGLang 的 `cache_unfinished_req` 只在 prefill/chunk 结束时调用，decode 期间树不更新（这是实现选择，不是语义要求，但确实省掉了每步的树操作）。所以第 5 个 token 的 KV 槽（槽 5）只属于 A，不进树。**这是 SGLang 版的「尾块浪费」：不满一页的尾巴不参与共享。**
+
+**第 3 步：B 只领 1 个新槽。** `match_prefix` 返回 4 个槽号，`extend_input_len = 5 - 4 = 1`，分配器只分配 1 个槽（槽 6）。B 的行是 `prefix_indices + [6]`。共享的 4 个槽号是**复制**进 B 的行的，不是引用一个块对象。
+
+**第 5 步：活跃前缀会挡住淘汰。** C 需要 4 槽，空闲只有 3 槽；`evict(4)` 唯一的叶子是那个 `lock_ref = 1`（B 还在用）的节点，直接 `continue`，一个字节都回收不了。SGLang 此时会报 OOM / 触发 retract，而不是把 B 正在读的 KV 抢走。**这和 vLLM 的「命中僵尸块要占准入名额」是同一类约束的两个方向**：vLLM 是「命中也要占名额」，SGLang 是「锁住就不让淘汰」。
+
+**第 6 步：B 结束后才能回收。** B 的 `dec_lock_ref` 把 `lock_ref` 降到 0，节点从 protected 变回 evictable。C 要 8 槽时，`evict(8)` 删掉叶子、free 掉 `[1,2,3,4]`，空闲回到 8。
+
+### 34.1 和 §14 的 vLLM 追踪并排
+
+| | vLLM §14 | SGLang §34 |
+|---|---|---|
+| 树/哈希的更新时机 | **每个调度步**的 `allocate_slots` → `cache_blocks` | prefill/chunk 结束、请求结束 |
+| A 长 5 时占的物理量 | 2 块（8 槽，有效 5） | 5 槽（其中 4 槽同时被树和 B 引用） |
+| B 命中 4 token 后新增 | 1 块（4 槽） | 1 槽 |
+| 共享的单位 | 物理块 | KV 槽号数组 |
+| A 结束后 | 块 2 释放，块 1 ref=1 | 行释放，尾槽释放，树节点 lock 2→1 |
+| B 结束后 | 块 1 ref=0，变僵尸块（hash 还在） | 节点 lock=0，变 evictable |
+| 淘汰单位 | 块 | 树叶子（一段 token） |
+| 淘汰后 hash/树结构 | `reset_hash()`，hash 从 map 删除 | `_delete_leaf`，节点从父节点摘除 |
+
+**结论：两套实现的「生命周期」形状是一样的**——分配 → 命中/共享 → 加锁 → 释放/解锁 → 延迟淘汰。差别只在「计数对象」是块还是树节点。
+
+---
+
+## 35 两套实现的取舍
+
+### 35.1 总表
+
+| 维度 | vLLM v0.11.0 | SGLang v0.5.2 |
+|---|---|---|
+| 分配单位 | 固定 `block_size`（默认 16） | `page_size`（默认 1；部分 backend 强制 16/32/64/128） |
+| 序列→物理 | `block_table` 块号数组 + `slot_mapping` | `req_to_token` 逐 token 槽号 |
+| 前缀索引 | 块级哈希链（父哈希 + 本块 token + extra_keys） | 基数树（原始 token 序列） |
+| 命中粒度 | 整块 | 整页 |
+| 共享方式 | `ref_cnt += 1`，块号不变 | 槽号数组复制进另一行 |
+| 去重 | **不做**（append-only 约束） | **做**（`_split_node` + 释放重复槽） |
+| 淘汰结构 | 双向空闲链表（队首 LRU） | 叶子最小堆（`last_access_time`） |
+| 淘汰时机 | `get_new_blocks` 内部，边分边腾 | `alloc_token_slots` 之前，先腾后分 |
+| 元数据开销 | 每块一个 `KVCacheBlock` | 每段 token 一个 `TreeNode` |
+| 0 号位 | null block（sliding window 占位） | padding slot（dummy 输出） |
+| 对后端的要求 | paged attention kernel 读 block table | attention 后端读 `kv_indices` |
+| 典型优势 | 块表简单、GPU 增量更新无锁、适合固定块 kernel | 前缀共享粒度细、树操作灵活、page_size 可调 |
+
+### 35.2 为什么 vLLM 选哈希链
+
+1. **块表是 append-only 的**。`BlockTable.append_row` 只往行尾写，`compute_slot_mapping` 只读。GPU 侧不需要同步「块号被改了」。
+2. **哈希链查找是 O(块数) 的字典查询**，不需要维护树、不需要分裂、不需要堆。
+3. **块级哈希天然编码了因果依赖**：父哈希进哈希，所以「第 i 块命中」自动意味着「前 i−1 块全部命中」。
+4. **代价**：只能整块共享；不能去重；尾块浪费上界 `B−1`；命中长度被 `(num_tokens−1)//B` 砍。
+
+### 35.3 为什么 SGLang 选基数树
+
+1. **`req_to_token` 是可变的**。共享就是把槽号复制进另一行，不需要保持块号稳定，所以可以 split / 去重。
+2. **树天然表达「最长前缀」**。`match_prefix` 沿树走，命中多长就是多长；`page_size = 1` 时可以精确到 token。
+3. **叶子 LRU 堆 + `lock_ref` 路径锁**，让淘汰和活跃请求的保护都落在同一棵树上，不需要额外的块引用计数。
+4. **代价**：每个节点是 Python 对象；split / heap / 路径加锁都是 CPU 开销；`page_size > 1` 时仍然有页对齐损失。
+
+### 35.4 五条跨实现的共同不变量
+
+不管用哪套实现，下面五条都成立。它们才是「PagedAttention + Prefix Caching」的本质，而不是某个具体数据结构：
+
+1. **只有满单位才缓存**：vLLM 是满块，SGLang 是满页。不满一块/一页的尾巴永远不共享。
+2. **最后一个 token 必须重算**：vLLM `max_cache_hit_length = num_tokens − 1`；SGLang `adjust_max_prefix_ids` 里 `max_prefix_len = input_len − 1`。原因相同：要拿 logits 就必须有一次前向。
+3. **共享的前缀是只读的**：没有任何一方会去改已经共享的 KV，所以不需要 COW。vLLM 靠「块号不变」，SGLang 靠「槽号只读复制」。
+4. **淘汰延迟到显存压力出现时**：vLLM 在 `get_new_blocks` 里惰性淘汰，SGLang 在 `alloc_token_slots` 前按需淘汰。请求结束时都不立刻清数据。
+5. **命中只省 prefill 算力，不省显存**：命中的块/页仍然占着池子；decode 仍然要读全部可见 KV；计费 token 照常算。
+
+### 35.5 怎么选
+
+这不是「谁更好」的问题，而是「你的后端和负载长什么样」：
+
+| 场景 | 更自然的选择 | 原因 |
+|---|---|---|
+| 用 vLLM 的 paged attention kernel，块大小固定 | vLLM 式块表 | kernel 直接吃 block table + slot mapping |
+| 前缀重复粒度细（多轮对话、共享系统提示词但长度不齐） | SGLang 式基数树 | `page_size=1` 时可以按 token 共享 |
+| 需要 KV 分层缓存（GPU/CPU/远端） | SGLang 式树 | 节点带 `host_value`，天然支持层级 |
+| 要求块表增量更新、GPU 无锁 | vLLM 式块表 | append-only + 块号稳定 |
+| 需要 sliding window / hybrid KV group | vLLM 式块表 | null block 占位 + 多 group coordinator |
+
+**但不要把这张表当成「二选一」的产品对比。** 两套引擎都在演进：vLLM 也有 hybrid KV cache、KV connector；SGLang 也有 paged allocator、chunk cache。真正稳定的是 §35.4 的五条不变量和 §29.4 的「映射是否可变」这个根约束。
+
 # 附录 A 可执行验证代码
 
-本文所有数字由下面这个脚本验证，**125 项断言全部通过**，纯标准库，不需要 torch 或 GPU。
+本文所有数字由下面这个脚本验证，**79 项断言全部通过**，纯标准库，不需要 torch 或 GPU。
 
 保存为 `verify_paged.py`，`python3 verify_paged.py` 即可运行。
 
@@ -2076,7 +2818,7 @@ assert 80 * cdiv(2049, RB) == 10320 > 10240           # 全长 1 个 token 就�
 | `find_longest_cache_hit` | 同上 | `:252` |
 | `max_length // block_size` | 同上 | `:271` |
 | `use_eagle` 丢最后一块 | 同上 | `:282` |
-| `BlockTable` 二维定长矩阵 | `vllm/v1/core/block_table.py` | `:34` |
+| `BlockTable` 二维定长矩阵 | `vllm/v1/worker/block_table.py` | `:16` |
 | `append_row`（只写行尾） | 同上 | `:49` |
 | `compute_slot_mapping` | 同上 | `:76` |
 | 不能用 `token_indices // B` 的警告 | 同上 | `:81` 注释 |
@@ -2153,6 +2895,299 @@ assert 80 * cdiv(2049, RB) == 10320 > 10240           # 全长 1 个 token 就�
 
 ---
 
+# 附录 D SGLang v0.5.2 源码索引
+
+路径相对 SGLang 仓库根。
+
+| 主题 | 文件 | 位置 |
+|---|---|---|
+| `TreeNode` 字段 | `python/sglang/srt/mem_cache/radix_cache.py` | `:43` |
+| `__lt__`（LRU 排序键） | 同上 | `:92` |
+| child key / page match | 同上 | `:138` / `:96` / `:105` |
+| `match_prefix` | 同上 | `:158` |
+| `insert` | 同上 | `:195` |
+| `cache_finished_req` | 同上 | `:203` |
+| `cache_unfinished_req` | 同上 | `:240` |
+| `evict`（叶子最小堆） | 同上 | `:294` |
+| `inc_lock_ref` / `dec_lock_ref` | 同上 | `:319` / `:333` |
+| `_match_prefix_helper` | 同上 | `:367` |
+| `_split_node` | 同上 | `:392` |
+| `_insert_helper` | 同上 | `:411` |
+| `_delete_leaf` | 同上 | `:462` |
+| `ReqToTokenPool` | `python/sglang/srt/mem_cache/memory_pool.py` | `:55` |
+| `req_to_token` 形状 | 同上 | `:74` |
+| `write` / `alloc` / `free` | 同上 | `:80` / `:86` / `:95` |
+| KV buffer 形状与 padding slot 0 | 同上 | `:449` |
+| `TokenToKVPoolAllocator` | `python/sglang/srt/mem_cache/allocator.py` | `:118` |
+| `clear` / `alloc` / `free` | 同上 | `:132` / `:145` / `:156` |
+| `PagedTokenToKVPoolAllocator` | 同上 | `:419` |
+| `page_size` 默认值 1 | `python/sglang/srt/server_args.py` | `:623` |
+| `adjust_max_prefix_ids`（`input_len − 1`） | `python/sglang/srt/managers/schedule_batch.py` | `:660` |
+| 命中槽号写入 `req_to_token` | 同上 | `:1193` |
+| `alloc_token_slots`（先淘汰后分配） | 同上 | `:979` |
+| `_evict_tree_cache_if_needed` | 同上 | `:1785` |
+
+---
+
+# 附录 E SGLang RadixCache 的可执行对照
+
+这是 `RadixCache` + `ReqToTokenPool` + allocator 的**语义等价模型**（不 import torch），用来验证 §34 的每一步状态转移。它和附录 A 的 `Pool` 是同一层意思：不是引擎本体，但每个方法都能和附录 D 的行号对上。
+
+保存为 `verify_sglang_radix.py`，`python3 verify_sglang_radix.py` 运行；33 项断言全部通过。
+
+```python
+from collections import defaultdict
+import heapq, time, itertools
+
+class TreeNode:
+    _id = itertools.count()
+    def __init__(self, key=None, value=None):
+        self.children = {}
+        self.parent = None
+        self.key = [] if key is None else key
+        self.value = [] if value is None else value
+        self.lock_ref = 0
+        self.last_access_time = time.monotonic()
+        self.id = next(TreeNode._id)
+    def __lt__(self, other):
+        return self.last_access_time < other.last_access_time
+
+class Allocator:
+    def __init__(self, size):
+        self.size = size
+        self.free = list(range(1, size + 1))     # slot 0 保留给 padding
+
+    def available(self):
+        return len(self.free)
+
+    def alloc(self, n):
+        assert n <= len(self.free)
+        out, self.free = self.free[:n], self.free[n:]
+        return out
+
+    def free_slots(self, xs):
+        self.free.extend(xs)
+
+class RadixCache:
+    def __init__(self, alloc, page_size=4):
+        self.alloc = alloc
+        self.page_size = page_size
+        self.root = TreeNode()
+        self.root.lock_ref = 1
+        self.evictable_size_ = 0
+        self.protected_size_ = 0
+        self.clock = itertools.count()
+
+    def _now(self):
+        return next(self.clock)
+
+    def _child_key(self, key):
+        return tuple(key[:self.page_size])
+
+    def _match_len(self, a, b):
+        i = 0
+        while i + self.page_size <= min(len(a), len(b)):
+            if a[i:i + self.page_size] != b[i:i + self.page_size]:
+                break
+            i += self.page_size
+        return i
+
+    def match_prefix(self, key):
+        key = key[:len(key) // self.page_size * self.page_size]
+        value, node = self._match_prefix_helper(self.root, key)
+        return [x for chunk in value for x in chunk], node
+
+    def _match_prefix_helper(self, node, key):
+        node.last_access_time = self._now()
+        value = []
+        while key:
+            ck = self._child_key(key)
+            if ck not in node.children:
+                break
+            child = node.children[ck]
+            child.last_access_time = self._now()
+            plen = self._match_len(child.key, key)
+            if plen < len(child.key):
+                new_node = self._split_node(child.key, child, plen)
+                value.append(new_node.value)
+                node = new_node
+                break
+            value.append(child.value)
+            node = child
+            key = key[plen:]
+        return value, node
+
+    def _split_node(self, key, child, split_len):
+        new_node = TreeNode(key[:split_len], child.value[:split_len])
+        new_node.children = {self._child_key(key[split_len:]): child}
+        new_node.parent = child.parent
+        new_node.lock_ref = child.lock_ref
+        child.parent = new_node
+        child.key = child.key[split_len:]
+        child.value = child.value[split_len:]
+        new_node.parent.children[self._child_key(key)] = new_node
+        return new_node
+
+    def insert(self, key, value=None):
+        if value is None:
+            value = list(key)
+        key = key[:len(key) // self.page_size * self.page_size]
+        value = value[:len(key)]
+        return self._insert_helper(self.root, key, value)
+
+    def _insert_helper(self, node, key, value):
+        node.last_access_time = self._now()
+        if not key:
+            return 0
+        total = 0
+        while key:
+            ck = self._child_key(key)
+            if ck not in node.children:
+                break
+            node = node.children[ck]
+            node.last_access_time = self._now()
+            plen = self._match_len(node.key, key)
+            total += plen
+            key, value = key[plen:], value[plen:]
+            if plen < len(node.key):
+                node = self._split_node(node.key, node, plen)
+        if key:
+            new_node = TreeNode(key, value)
+            new_node.parent = node
+            node.children[self._child_key(key)] = new_node
+            self.evictable_size_ += len(value)
+        return total
+
+    def inc_lock_ref(self, node):
+        while node is not self.root:
+            if node.lock_ref == 0:
+                self.evictable_size_ -= len(node.value)
+                self.protected_size_ += len(node.value)
+            node.lock_ref += 1
+            node = node.parent
+
+    def dec_lock_ref(self, node):
+        while node is not self.root:
+            if node.lock_ref == 1:
+                self.evictable_size_ += len(node.value)
+                self.protected_size_ -= len(node.value)
+            node.lock_ref -= 1
+            node = node.parent
+
+    def _collect_leaves(self):
+        out, stack = [], [self.root]
+        while stack:
+            n = stack.pop()
+            if not n.children:
+                out.append(n)
+            else:
+                stack.extend(n.children.values())
+        return out
+
+    def evict(self, num_tokens):
+        leaves = self._collect_leaves()
+        heapq.heapify(leaves)
+        evicted = 0
+        while evicted < num_tokens and leaves:
+            x = heapq.heappop(leaves)
+            if x is self.root:
+                break
+            if x.lock_ref > 0:
+                continue
+            self.alloc.free_slots(x.value)
+            evicted += len(x.value)
+            del x.parent.children[self._child_key(x.key)]
+            self.evictable_size_ -= len(x.key)
+            if not x.parent.children:
+                heapq.heappush(leaves, x.parent)
+        return evicted
+
+    def total_size(self):
+        out, stack = 0, [self.root]
+        while stack:
+            n = stack.pop()
+            out += len(n.value)
+            stack.extend(n.children.values())
+        return out
+
+
+# ---------- §34 的完整追踪 ----------
+a = Allocator(8)
+c = RadixCache(a, page_size=4)
+
+# A: prompt 4；prefill 结束就插入整页
+A = a.alloc(4)
+assert c.insert([1, 2, 3, 4], A) == 0
+prefix, last = c.match_prefix([1, 2, 3, 4])
+c.inc_lock_ref(last)
+assert prefix == [1, 2, 3, 4]
+assert last.lock_ref == 1
+assert c.evictable_size_ == 0
+assert c.protected_size_ == 4
+assert a.available() == 4
+
+# A: decode 到 5；decode 不更新树
+A += a.alloc(1)
+assert c.insert([1, 2, 3, 4, 5], A) == 4
+assert c.total_size() == 4          # 第 5 个 token 不在树里
+assert a.available() == 3
+
+# B: 命中 4，只领 1 个新槽
+B = a.alloc(1)
+prefix, bl = c.match_prefix([1, 2, 3, 4, 9])
+c.inc_lock_ref(bl)
+assert prefix == [1, 2, 3, 4]
+assert B == [6]
+assert prefix + B == [1, 2, 3, 4, 6]
+assert bl.lock_ref == 2
+assert c.protected_size_ == 4
+assert a.available() == 2
+
+# A 结束
+c.insert([1, 2, 3, 4], A[:4])
+a.free_slots(A[4:])
+c.dec_lock_ref(last)
+assert a.available() == 3
+assert c.protected_size_ == 4
+assert c.evict(4) == 0              # B 还锁着，淘汰不了
+assert a.available() == 3
+assert c.total_size() == 4
+
+# B 结束
+a.free_slots(B)
+c.dec_lock_ref(bl)
+assert c.evictable_size_ == 4
+assert c.protected_size_ == 0
+assert c.evict(8) == 4
+assert a.available() == 8
+assert c.total_size() == 0
+assert len(c.root.children) == 0
+
+# ---------- page_size = 1：token 粒度共享 ----------
+a1 = Allocator(8)
+c1 = RadixCache(a1, page_size=1)
+v = a1.alloc(2)
+c1.insert([1, 2], v)
+assert c1.total_size() == 2
+p1, n1 = c1.match_prefix([1, 2, 3])
+assert p1 == [1, 2]                 # page_size=1 时可精确到 token
+
+# ---------- split 不复制 KV ----------
+a2 = Allocator(16)
+c2 = RadixCache(a2, page_size=4)
+v8 = a2.alloc(8)
+c2.insert(list(range(1, 9)), v8)
+assert c2.total_size() == 8
+p2, n2 = c2.match_prefix([1, 2, 3, 4, 9])
+assert p2 == [1, 2, 3, 4]
+assert n2.key == [1, 2, 3, 4]
+assert c2.total_size() == 8         # 分裂前后总长度不变
+```
+
+---
+
 ## 一句话总结
 
 **PagedAttention 用「固定块 + 查表」把「随 `max_len` 放大的预留浪费」换成「上界 `B−1` 的尾块浪费」，并消除外碎片、让跨请求共享成为可能；它一个字节的 KV 读取都没省，吞吐提升来自 batch 变大。Prefix caching 用「父哈希链」把因果注意力的前缀依赖编码成可查表的 key，用「引用计数 + 僵尸块 + 惰性淘汰」把复用窗口开到最大；它只省 prefill FLOPs，而且因为 `(num_tokens−1) // B` 的对齐约束，命中率再高也总要重算一点。**
+
+换到 SGLang，块表变成逐 token 槽号、哈希链变成基数树、双向空闲链表变成叶子 LRU 堆；但 §35.4 的五条不变量一条没变：**满单位才缓存、最后一个 token 重算、共享前缀只读、淘汰延迟到压力出现、命中只省算力不省显存。**
