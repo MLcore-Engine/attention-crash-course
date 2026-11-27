@@ -25,7 +25,7 @@
 
 ### [`examples/vllm_kv_cache/`](./examples/vllm_kv_cache/README.md)
 
-vLLM v0.11.0 的本地源码学习例子：从 `slot_mapping`、K/V cache 写入布局到 paged attention 读取，附 Apache-2.0 上游源码和可运行的 CPU 地址映射 demo。
+vLLM v0.11.0 的 KV cache 源码逐行课程。从显存池创建、请求领块、`slot_mapping`、CUDA 写入和 FlashAttention 读取，一直追到前缀共享、引用计数、释放和抢占。附完整固定版本源码、逐行解释、数值例子和直接执行上游 CPU 块管理代码的演示。先从目录中的第 1 课开始。
 
 ### [`LLM推理全链路-从玩具模型到GPU水位.md`](./LLM推理全链路-从玩具模型到GPU水位.md)
 

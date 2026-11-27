@@ -1,4 +1,27 @@
-# vLLM KV Cache: From Slot Mapping to Attention Reads
+# vLLM KV Cache 源码逐行学习
+
+先按下面四课读一遍 A 的生命周期，每课都给出固定版本的原始代码、准确行号、逐行解释和代入的数值。主线为 vLLM v0.11.0 的 V1、CUDA、BF16、full attention，包含 FlashAttention 的实际页表读取实现。
+
+| 顺序 | 要弄懂的问题 | 阅读 |
+|---|---|---|
+| 1 | GPU 上的缓存由哪一行创建，每个块到底占多少字节 | [显存里到底放了什么](lessons/01-显存里到底放了什么.md) |
+| 2 | 17 个 token 怎样领到两块，生成到第几个 token 才会再领一块 | [请求怎样领到块](lessons/02-请求怎样领到块.md) |
+| 3 | position 怎样变成 slot，再变成 K/V 的字节地址，读取怎样查块表 | [从位置算到显存地址](lessons/03-从位置算到显存地址.md) |
+| 4 | 相同前缀怎样共享，请求结束后引用、数据和 hash 分别怎样变化 | [前缀复用、释放与抢占](lessons/04-前缀复用释放与抢占.md) |
+| 5 | 定位其他后端、混合缓存、MLA、量化、迁移与上游测试 | [源码全景与验证](lessons/05-源码全景与验证.md) |
+
+这一遍固定每块 16 个 token、8 个块号、两层、两个 KV 头、head_dim=32。A 的 17 个输入 token 先领到 1、2 号块，B 复用 A 的第一页、另领尾页，随后追到 A 增长、A/B 结束、C 命中和 D 淘汰。每一步都能在 CPU 运行时看到块表与引用计数。
+
+```bash
+python3 examples/vllm_kv_cache/verify_sources.py
+python3 examples/vllm_kv_cache/lifecycle_demo.py
+```
+
+第二个命令直接从本地原始文件提取并执行上游的 CPU 块池、双向队列及 hash 函数。它用 Python 数组演示 GPU 地址与 K/V 数值，源投影和 CUDA kernel 由教学数据模型表示。本机验证覆盖 CPU 逻辑与地址断言。
+
+两份完整源码快照在 [upstream/source](upstream/source) 和 [upstream/flash-attention](upstream/flash-attention)，共 4,024 个文件。版本、Git blob、SHA-256 和依赖提交记录在 [SOURCE_MANIFEST.json](SOURCE_MANIFEST.json)。本课程沿用现有教程的 v0.11.0，源码行号和行为以该提交为准。
+
+## 既有的 custom-layout 地址例子
 
 This small study follows the **vLLM v0.11.0** CUDA paged-attention path. The
 `upstream/` directory contains the corresponding upstream files, kept with the
