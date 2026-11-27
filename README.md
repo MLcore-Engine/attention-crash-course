@@ -23,6 +23,10 @@
 
 面向推理系统的中文速查表：覆盖 KV 容量估算、Paged KV 与 Prefix Caching、KV 压缩、Attention Kernel、调度、Speculative Decoding、量化及排障。更新基准为 2026-11-25，附论文和官方文档链接。
 
+### [`examples/vllm_kv_cache/`](./examples/vllm_kv_cache/README.md)
+
+vLLM v0.11.0 的本地源码学习例子：从 `slot_mapping`、K/V cache 写入布局到 paged attention 读取，附 Apache-2.0 上游源码和可运行的 CPU 地址映射 demo。
+
 ### [`LLM推理全链路-从玩具模型到GPU水位.md`](./LLM推理全链路-从玩具模型到GPU水位.md)
 
 主线文档。回答一个问题：**为什么 LLM 推理的瓶颈不在算力，而在带宽？**
